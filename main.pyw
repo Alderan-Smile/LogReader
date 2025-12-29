@@ -6,6 +6,7 @@ import json
 import os
 import hashlib
 from pathlib import Path
+from urllib.parse import urlparse
 import re
 import tkinter as tk
 from tkinter import simpledialog, messagebox
@@ -64,7 +65,7 @@ class LogReaderThread(threading.Thread):
                             continue
                 except SSLError as e:
                     # If SSL error, ask user (via prompt_callback) whether to continue ignoring SSL errors
-                    self.update_callback(f"\n[SSL Error] {e} for {self.url}\n")
+                    # Do not write SSL errors into the log buffer (avoid polluting the log view)
                     if self.auto_accept_ssl:
                         self.verify = False
                         # retry immediately
@@ -135,7 +136,7 @@ class LogReaderThread(threading.Thread):
 
 
 class LogTab:
-    def __init__(self, notebook, url, name=None, interval=1.0, proxies=None, verify=True, prompt_callback=None, auto_scroll_default=False, cache_path=None, use_cache=False):
+    def __init__(self, notebook, url, name=None, interval=1.0, proxies=None, verify=True, prompt_callback=None, auto_scroll_default=False, cache_path=None, use_cache=False, trust_store=None):
         self.frame = ttk.Frame(notebook)
         self.url = url
         self.name = name or url
@@ -186,6 +187,7 @@ class LogTab:
 
         # pass proxies/verify and a prompt callback so threads can ask GUI to ignore SSL
         self._prompt_cb = prompt_callback
+        self.trust_store = trust_store
         self.thread = LogReaderThread(self.url, self._on_update, interval=interval, proxies=proxies, verify=verify, prompt_callback=self.prompt_ssl_continue)
         self.thread.start()
 
@@ -381,7 +383,19 @@ class LogTab:
             # schedule on GUI thread
             self.text.after(0, ask)
             ev.wait()
-            return bool(result.get('ans'))
+            ans = bool(result.get('ans'))
+            if ans and self.trust_store:
+                # persist trust for this host so future connections won't prompt
+                try:
+                    host = urlparse(url).hostname
+                    if host:
+                        try:
+                            self.trust_store(host)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            return ans
         except Exception:
             return False
 
@@ -446,6 +460,7 @@ class LogViewerApp:
         menubar.add_cascade(label='Archivo', menu=filemenu)
         root.config(menu=menubar)
 
+        self.trusted_hosts = cfg.get('trusted_hosts', [])
         self.tabs = {}
         # restore previous session (after tabs dict created)
         try:
@@ -461,7 +476,16 @@ class LogViewerApp:
         h = hashlib.sha1(url.encode('utf-8')).hexdigest()
         safe_name = f"log_{h}.log"
         cache_path = os.path.join(cache_dir, safe_name)
-        tab = LogTab(self.notebook, url, name=name, interval=interval, proxies=self.proxies, verify=self.verify_default, prompt_callback=None, auto_scroll_default=self.auto_scroll_default, cache_path=cache_path, use_cache=self.use_cache_default)
+        # determine if this host is already trusted
+        try:
+            host = urlparse(url).hostname
+        except Exception:
+            host = None
+        verify_flag = self.verify_default
+        if host and host in self.trusted_hosts:
+            verify_flag = False
+
+        tab = LogTab(self.notebook, url, name=name, interval=interval, proxies=self.proxies, verify=verify_flag, prompt_callback=None, auto_scroll_default=self.auto_scroll_default, cache_path=cache_path, use_cache=self.use_cache_default, trust_store=self.add_trusted_host)
         display = name or url
         self.notebook.add(tab.frame, text=display)
         self.tabs[tab.frame] = tab
@@ -573,6 +597,21 @@ class LogViewerApp:
         try:
             with open(self.config_path, 'w', encoding='utf-8') as f:
                 json.dump(cfg, f, indent=2)
+        except Exception:
+            pass
+
+    def add_trusted_host(self, host):
+        try:
+            if not hasattr(self, 'trusted_hosts'):
+                self.trusted_hosts = []
+            if host and host not in self.trusted_hosts:
+                self.trusted_hosts.append(host)
+                cfg = self.load_config()
+                cfg['trusted_hosts'] = self.trusted_hosts
+                try:
+                    self.save_config(cfg)
+                except Exception:
+                    pass
         except Exception:
             pass
 
