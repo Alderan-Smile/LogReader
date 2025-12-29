@@ -113,18 +113,35 @@ class LogReaderThread(threading.Thread):
                             self._pos += len(content)
                             self.update_callback(content.decode('utf-8', errors='replace'))
                     else:
-                        # 200 OK: server may not support Range. Compare length.
-                        if len(content) < len(self._last_content):
-                            # Log rotated/truncated: replace all
+                        # 200 OK: server may not support Range. Try to detect new bytes without duplicating or reordering
+                        if not self._last_content:
+                            # No previous content known -> replace whole view
                             self._pos = len(content)
                             self._last_content = content
                             self.update_callback(content.decode('utf-8', errors='replace'), replace=True)
-                        elif len(content) > len(self._last_content):
-                            new_part = content[len(self._last_content):]
-                            self._pos = len(content)
-                            self._last_content = content
-                            self.update_callback(new_part.decode('utf-8', errors='replace'))
-                        # else: unchanged
+                        else:
+                            # Try to find previous buffer inside the returned full content
+                            try:
+                                idx = content.find(self._last_content)
+                            except Exception:
+                                idx = -1
+                            if idx != -1:
+                                # previous buffer found inside content; new data (if any) is after it
+                                new_start = idx + len(self._last_content)
+                                if new_start < len(content):
+                                    new_part = content[new_start:]
+                                    self._pos = len(content)
+                                    self._last_content = content
+                                    self.update_callback(new_part.decode('utf-8', errors='replace'))
+                                else:
+                                    # no new bytes
+                                    self._pos = len(content)
+                                    self._last_content = content
+                            else:
+                                # previous content not found -> likely rotated/truncated; replace all
+                                self._pos = len(content)
+                                self._last_content = content
+                                self.update_callback(content.decode('utf-8', errors='replace'), replace=True)
 
                     # Save ETag if provided
                     etag = resp.headers.get('ETag')
