@@ -109,7 +109,7 @@ class LogReaderThread(threading.Thread):
 
 
 class LogTab:
-    def __init__(self, notebook, url, name=None, interval=1.0, proxies=None, verify=True, prompt_callback=None):
+    def __init__(self, notebook, url, name=None, interval=1.0, proxies=None, verify=True, prompt_callback=None, auto_scroll_default=False):
         self.frame = ttk.Frame(notebook)
         self.url = url
         self.name = name or url
@@ -147,7 +147,6 @@ class LogTab:
         ttk.Checkbutton(controls, text='Auto-scroll', variable=self.auto_scroll).pack(side='left', padx=8)
 
         # pass proxies/verify and a prompt callback so threads can ask GUI to ignore SSL
-        self._prompt_cb = prompt_callback
         self._prompt_cb = prompt_callback
         self.thread = LogReaderThread(self.url, self._on_update, interval=interval, proxies=proxies, verify=verify, prompt_callback=self.prompt_ssl_continue)
         self.thread.start()
