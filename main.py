@@ -113,14 +113,14 @@ class LogTab:
         self.frame = ttk.Frame(notebook)
         self.url = url
         self.name = name or url
-            self.text = scrolledtext.ScrolledText(self.frame, wrap='none', height=30)
-            self.text.pack(fill='both', expand=True)
-            # add horizontal scrollbar
-            try:
-                hscroll = ttk.Scrollbar(self.frame, orient='horizontal', command=self.text.xview)
-                self.text.configure(xscrollcommand=hscroll.set)
-                hscroll.pack(fill='x')
-            except Exception:
+        self.text = scrolledtext.ScrolledText(self.frame, wrap='none', height=30)
+        self.text.pack(fill='both', expand=True)
+        # add horizontal scrollbar
+        try:
+            hscroll = ttk.Scrollbar(self.frame, orient='horizontal', command=self.text.xview)
+            self.text.configure(xscrollcommand=hscroll.set)
+            hscroll.pack(fill='x')
+        except Exception:
                 pass
         self.text.configure(state='disabled')
         # keep full buffer in memory to allow filtering/searching
