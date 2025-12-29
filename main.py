@@ -2,6 +2,8 @@ import threading
 import requests
 from requests.exceptions import SSLError
 import time
+import json
+import os
 import re
 import tkinter as tk
 from tkinter import simpledialog, messagebox
@@ -111,15 +113,22 @@ class LogTab:
         self.frame = ttk.Frame(notebook)
         self.url = url
         self.name = name or url
-        self.text = scrolledtext.ScrolledText(self.frame, wrap='none', height=30)
-        self.text.pack(fill='both', expand=True)
+            self.text = scrolledtext.ScrolledText(self.frame, wrap='none', height=30)
+            self.text.pack(fill='both', expand=True)
+            # add horizontal scrollbar
+            try:
+                hscroll = ttk.Scrollbar(self.frame, orient='horizontal', command=self.text.xview)
+                self.text.configure(xscrollcommand=hscroll.set)
+                hscroll.pack(fill='x')
+            except Exception:
+                pass
         self.text.configure(state='disabled')
         # keep full buffer in memory to allow filtering/searching
         self.buffer = ""
         self.matches = []
         self.current_match = -1
         # Auto-scroll default off: do not force user to the end on updates
-        self.auto_scroll = tk.BooleanVar(value=False)
+        self.auto_scroll = tk.BooleanVar(value=auto_scroll_default)
 
         controls = ttk.Frame(self.frame)
         controls.pack(fill='x')
@@ -138,6 +147,7 @@ class LogTab:
         ttk.Checkbutton(controls, text='Auto-scroll', variable=self.auto_scroll).pack(side='left', padx=8)
 
         # pass proxies/verify and a prompt callback so threads can ask GUI to ignore SSL
+        self._prompt_cb = prompt_callback
         self._prompt_cb = prompt_callback
         self.thread = LogReaderThread(self.url, self._on_update, interval=interval, proxies=proxies, verify=verify, prompt_callback=self.prompt_ssl_continue)
         self.thread.start()
@@ -200,6 +210,15 @@ class LogTab:
         else:
             view = self.buffer
 
+        # preserve current view fraction so user doesn't get moved to start on updates
+        try:
+            first_frac = first
+        except NameError:
+            try:
+                first_frac = self.text.yview()[0]
+            except Exception:
+                first_frac = 0.0
+
         self.text.configure(state='normal')
         self.text.delete('1.0', tk.END)
         self.text.insert(tk.END, view)
@@ -207,9 +226,16 @@ class LogTab:
         # re-run highlight for current search
         if self.search_var.get().strip():
             self.highlight_matches(self.search_var.get().strip())
-        # Only auto-scroll if the user enabled it AND the view was already at the bottom
-        if self.auto_scroll.get() and at_bottom_before:
-            self.text.see(tk.END)
+
+        try:
+            if self.auto_scroll.get() and at_bottom_before:
+                self.text.see(tk.END)
+            else:
+                # restore previous view position proportionally
+                self.text.yview_moveto(first_frac)
+        except Exception:
+            pass
+
         self.text.configure(state='disabled')
 
     def toggle_pause(self):
@@ -341,9 +367,14 @@ class LogViewerApp:
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill='both', expand=True)
 
-        # global network settings
-        self.proxies = {}
-        self.verify_default = True
+        # config path
+        self.config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+        cfg = self.load_config()
+
+        # global network/settings
+        self.proxies = cfg.get('proxies', {})
+        self.verify_default = cfg.get('verify_default', True)
+        self.auto_scroll_default = cfg.get('auto_scroll_default', False)
 
         menubar = tk.Menu(root)
         filemenu = tk.Menu(menubar, tearoff=0)
@@ -359,7 +390,7 @@ class LogViewerApp:
         self.tabs = {}
 
     def add_log(self, url, name=None, interval=1.0):
-        tab = LogTab(self.notebook, url, name=name, interval=interval, proxies=self.proxies, verify=self.verify_default, prompt_callback=None)
+        tab = LogTab(self.notebook, url, name=name, interval=interval, proxies=self.proxies, verify=self.verify_default, prompt_callback=None, auto_scroll_default=self.auto_scroll_default)
         display = name or url
         self.notebook.add(tab.frame, text=display)
         self.tabs[tab.frame] = tab
@@ -391,6 +422,32 @@ class LogViewerApp:
             tab.stop()
         self.root.quit()
 
+    def load_config(self):
+        # Load config.json or create default
+        default = {'proxies': {}, 'verify_default': True, 'auto_scroll_default': False}
+        try:
+            if os.path.exists(self.config_path):
+                with open(self.config_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    # merge defaults
+                    for k, v in default.items():
+                        data.setdefault(k, v)
+                    return data
+            else:
+                # create default file
+                with open(self.config_path, 'w', encoding='utf-8') as f:
+                    json.dump(default, f, indent=2)
+                return default
+        except Exception:
+            return default
+
+    def save_config(self, cfg):
+        try:
+            with open(self.config_path, 'w', encoding='utf-8') as f:
+                json.dump(cfg, f, indent=2)
+        except Exception:
+            pass
+
     def open_settings(self):
         # Simple settings dialog to set proxies and default SSL verify
         dlg = tk.Toplevel(self.root)
@@ -410,6 +467,9 @@ class LogViewerApp:
         verify_var = tk.BooleanVar(value=self.verify_default)
         ttk.Checkbutton(dlg, text='Verificar certificados SSL (recomendado)', variable=verify_var).grid(row=2, column=0, columnspan=2, sticky='w', padx=6)
 
+        autos_var = tk.BooleanVar(value=self.auto_scroll_default)
+        ttk.Checkbutton(dlg, text='Auto-scroll al final por defecto', variable=autos_var).grid(row=2, column=1, columnspan=1, sticky='w', padx=6)
+
         def save():
             p = {}
             if http_var.get().strip():
@@ -418,13 +478,25 @@ class LogViewerApp:
                 p['https'] = https_var.get().strip()
             self.proxies = p
             self.verify_default = bool(verify_var.get())
+            self.auto_scroll_default = bool(autos_var.get())
             # update existing tabs
             for tab in list(self.tabs.values()):
                 try:
                     tab.thread.proxies = dict(self.proxies)
                     tab.thread.verify = self.verify_default
+                    tab.auto_scroll.set(self.auto_scroll_default)
                 except Exception:
                     pass
+            # save to config
+            cfg = {
+                'proxies': self.proxies,
+                'verify_default': self.verify_default,
+                'auto_scroll_default': self.auto_scroll_default,
+            }
+            try:
+                self.save_config(cfg)
+            except Exception:
+                pass
             dlg.destroy()
 
         ttk.Button(dlg, text='Guardar', command=save).grid(row=3, column=0, pady=8)
