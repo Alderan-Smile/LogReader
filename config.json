@@ -1,5 +1,8 @@
 {
   "proxies": {},
   "verify_default": true,
-  "auto_scroll_default": false
+  "auto_scroll_default": false,
+  "use_cache_default": true,
+  "auto_accept_ssl": false,
+  "trusted_hosts": []
 }

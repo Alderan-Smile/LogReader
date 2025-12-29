@@ -8,6 +8,9 @@ import hashlib
 from pathlib import Path
 from urllib.parse import urlparse
 import re
+import queue
+import mmap
+import tempfile
 import tkinter as tk
 from tkinter import simpledialog, messagebox
 from tkinter import scrolledtext
@@ -15,7 +18,7 @@ from tkinter import ttk
 
 
 class LogReaderThread(threading.Thread):
-    def __init__(self, url, update_callback, interval=1.0, proxies=None, verify=True, prompt_callback=None, auto_accept_ssl=False):
+    def __init__(self, url, update_callback, interval=1.0, proxies=None, verify=True, prompt_callback=None, auto_accept_ssl=False, tail_bytes=65536):
         super().__init__(daemon=True)
         self.url = url
         self.update_callback = update_callback
@@ -31,14 +34,19 @@ class LogReaderThread(threading.Thread):
         # callback(url) -> bool (whether to continue ignoring SSL)
         self.prompt_callback = prompt_callback
         self.auto_accept_ssl = bool(auto_accept_ssl)
+        self.tail_bytes = int(tail_bytes or 0)
+        self._initial_loaded = False
 
     def run(self):
         while not self._stop_event.is_set():
             self._pause_event.wait()
             try:
                 headers = {}
-                # Try to use Range if we have a position
-                if self._pos > 0:
+                # For first load, try to request only the tail to avoid downloading huge files
+                if not self._initial_loaded and self.tail_bytes > 0:
+                    headers['Range'] = f'bytes=-{self.tail_bytes}'
+                # Subsequent requests use the current position to fetch new bytes
+                elif self._pos > 0:
                     headers['Range'] = f'bytes={self._pos}-'
                 if self._etag:
                     headers['If-None-Match'] = self._etag
@@ -86,6 +94,19 @@ class LogReaderThread(threading.Thread):
 
                 if resp.status_code in (200, 206):
                     content = resp.content
+                    # mark initial as loaded after a successful response
+                    if not self._initial_loaded:
+                        self._initial_loaded = True
+                        # if we received a tail (200 but with Range requested), we should set _last_content accordingly
+                        # For 206 (partial) server supports Range; for 200 we may have received full or partial
+                        # We will treat received content as the current snapshot
+                        self._last_content = content
+                        self._pos = len(content)
+                        # If we requested tail, we append it to view (replace existing empty)
+                        self.update_callback(content.decode('utf-8', errors='replace'), replace=True)
+                        # continue to next cycle
+                        time.sleep(self.interval)
+                        continue
                     # If server responded with partial content (206) append from 0
                     if resp.status_code == 206:
                         if content:
@@ -150,7 +171,9 @@ class LogTab:
         except Exception:
                 pass
         self.text.configure(state='disabled')
-        # keep full buffer in memory to allow filtering/searching
+        # keep small buffer in memory to allow filtering/searching of visible area
+        # for very large logs we avoid loading full cache into memory
+        self.view_bytes = 65536
         self.buffer = ""
         self.matches = []
         self.current_match = -1
@@ -164,8 +187,18 @@ class LogTab:
             try:
                 p = Path(self.cache_path)
                 if p.exists():
-                    with p.open('r', encoding='utf-8', errors='replace') as f:
-                        self.buffer = f.read()
+                    # load only the last view_bytes to avoid memory spikes
+                    with p.open('rb') as f:
+                        try:
+                            f.seek(0, os.SEEK_END)
+                            sz = f.tell()
+                            start = max(0, sz - self.view_bytes)
+                            f.seek(start)
+                            data = f.read()
+                            # decode safely
+                            self.buffer = data.decode('utf-8', errors='replace')
+                        except Exception:
+                            self.buffer = ""
             except Exception:
                 self.buffer = ""
 
@@ -188,7 +221,8 @@ class LogTab:
         # pass proxies/verify and a prompt callback so threads can ask GUI to ignore SSL
         self._prompt_cb = prompt_callback
         self.trust_store = trust_store
-        self.thread = LogReaderThread(self.url, self._on_update, interval=interval, proxies=proxies, verify=verify, prompt_callback=self.prompt_ssl_continue)
+        # pass tail_bytes so initial load fetches only the end
+        self.thread = LogReaderThread(self.url, self._on_update, interval=interval, proxies=proxies, verify=verify, prompt_callback=self.prompt_ssl_continue, tail_bytes=self.view_bytes)
         self.thread.start()
 
         # --- Controls: búsqueda / filtro / resaltado ---
@@ -200,6 +234,10 @@ class LogTab:
         self.search_entry = ttk.Entry(ctrl2, textvariable=self.search_var, width=30)
         self.search_entry.pack(side='left', padx=4)
         ttk.Button(ctrl2, text='Buscar', command=self.perform_search).pack(side='left')
+        # bind debounce for realtime search
+        self._search_after_id = None
+        self.search_entry.bind('<KeyRelease>', lambda e: self._on_search_change())
+        ttk.Button(ctrl2, text='Buscar archivo', command=self.perform_search_full).pack(side='left', padx=2)
         ttk.Button(ctrl2, text='Prev', command=self.goto_prev_match).pack(side='left', padx=2)
         ttk.Button(ctrl2, text='Next', command=self.goto_next_match).pack(side='left', padx=2)
 
@@ -212,6 +250,12 @@ class LogTab:
 
         # Tag for highlights
         self.text.tag_config('hl', background='yellow')
+        # UI feedback for background search
+        self.search_status = tk.StringVar(value='')
+        ttk.Label(self.frame, textvariable=self.search_status, foreground='blue').pack(fill='x')
+        self._search_thread = None
+        self._search_queue = queue.Queue()
+        self._showing_search_results = False
 
     def _on_update(self, new_text, replace=False):
         # maintain internal buffer then refresh view according to any filter
@@ -241,6 +285,132 @@ class LogTab:
             self.text.after(0, ui_update)
         except tk.TclError:
             pass
+
+    def _on_search_change(self):
+        # debounce key presses
+        try:
+            if self._search_after_id:
+                self.text.after_cancel(self._search_after_id)
+        except Exception:
+            pass
+        self._search_after_id = self.text.after(300, self.perform_search)
+
+    def perform_search(self):
+        term = self.search_var.get().strip()
+        if not term:
+            return
+        # If a previous search thread is running, ignore or wait
+        if self._search_thread and self._search_thread.is_alive():
+            # indicate queued
+            self.search_status.set('Buscando (en cola)...')
+            return
+
+        # Start background search over cache file if available, otherwise over buffer
+        if self.use_cache and self.cache_path and os.path.exists(self.cache_path):
+            self.search_status.set('Buscando en archivo...')
+            self._search_thread = threading.Thread(target=self._search_in_file, args=(term,), daemon=True)
+            self._search_thread.start()
+            self._poll_search()
+        else:
+            # small search in memory buffer
+            try:
+                self.text.configure(state='normal')
+                self.clear_highlight()
+                self.highlight_matches(term)
+                self.text.configure(state='disabled')
+                self.current_match = 0 if self.matches else -1
+                if self.current_match != -1:
+                    self.goto_match(self.current_match)
+            except Exception:
+                pass
+
+    def _poll_search(self):
+        # poll queue for results
+        try:
+            res = self._search_queue.get_nowait()
+        except queue.Empty:
+            if self._search_thread and self._search_thread.is_alive():
+                self.text.after(100, self._poll_search)
+            else:
+                self.search_status.set('')
+            return
+
+        # res is list of matched lines (strings)
+        matches = res
+        self._showing_search_results = True
+        # display matches as the view (replace)
+        try:
+            self.text.configure(state='normal')
+            self.text.delete('1.0', tk.END)
+            self.text.insert(tk.END, ''.join(matches))
+            self.text.configure(state='disabled')
+            self.search_status.set(f'Mostrando {len(matches)} coincidencias')
+        except Exception:
+            pass
+
+    def _search_in_file(self, term):
+        # background file search using mmap for performance
+        matches = []
+        try:
+            is_regex = False
+            try:
+                pattern = re.compile(term)
+                is_regex = True
+            except re.error:
+                is_regex = False
+
+            with open(self.cache_path, 'rb') as f:
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+                    if is_regex:
+                        for mobj in pattern.finditer(m):
+                            start = mobj.start()
+                            # extract line
+                            line_start = m.rfind(b'\n', 0, start) + 1
+                            line_end = m.find(b'\n', start)
+                            if line_end == -1:
+                                line_end = m.size()
+                            line = m[line_start:line_end].decode('utf-8', errors='replace')
+                            matches.append(line + '\n')
+                    else:
+                        needle = term.encode('utf-8')
+                        idx = 0
+                        while True:
+                            idx = m.find(needle, idx)
+                            if idx == -1:
+                                break
+                            line_start = m.rfind(b'\n', 0, idx) + 1
+                            line_end = m.find(b'\n', idx)
+                            if line_end == -1:
+                                line_end = m.size()
+                            line = m[line_start:line_end].decode('utf-8', errors='replace')
+                            matches.append(line + '\n')
+                            idx = idx + len(needle)
+        except Exception:
+            matches = ['[Error buscando en archivo]\n']
+
+        # put results in queue for UI thread
+        try:
+            # limit to first 1000 matches to avoid huge UI
+            self._search_queue.put(matches[:1000])
+        except Exception:
+            pass
+
+    def perform_search_full(self):
+        term = self.search_var.get().strip()
+        if not term:
+            self.search_status.set('Ingrese término de búsqueda')
+            return
+        if not (self.use_cache and self.cache_path and os.path.exists(self.cache_path)):
+            self.search_status.set('No hay archivo cache para buscar. Activa caché o espera a que se genere.')
+            return
+        # start search in file immediately
+        if self._search_thread and self._search_thread.is_alive():
+            self.search_status.set('Búsqueda ya en curso...')
+            return
+        self.search_status.set('Buscando en archivo completo...')
+        self._search_thread = threading.Thread(target=self._search_in_file, args=(term,), daemon=True)
+        self._search_thread.start()
+        self._poll_search()
 
     def refresh_view(self):
         # determine whether view is currently at bottom (before update)
