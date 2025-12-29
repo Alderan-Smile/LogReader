@@ -1,5 +1,6 @@
 import threading
 import requests
+from requests.exceptions import SSLError
 import time
 import re
 import tkinter as tk
@@ -9,7 +10,7 @@ from tkinter import ttk
 
 
 class LogReaderThread(threading.Thread):
-    def __init__(self, url, update_callback, interval=1.0):
+    def __init__(self, url, update_callback, interval=1.0, proxies=None, verify=True, prompt_callback=None):
         super().__init__(daemon=True)
         self.url = url
         self.update_callback = update_callback
@@ -20,6 +21,10 @@ class LogReaderThread(threading.Thread):
         self._pos = 0
         self._etag = None
         self._last_content = b""
+        self.proxies = proxies or {}
+        self.verify = verify
+        # callback(url) -> bool (whether to continue ignoring SSL)
+        self.prompt_callback = prompt_callback
 
     def run(self):
         while not self._stop_event.is_set():
@@ -32,7 +37,23 @@ class LogReaderThread(threading.Thread):
                 if self._etag:
                     headers['If-None-Match'] = self._etag
 
-                resp = requests.get(self.url, headers=headers, stream=False, timeout=10)
+                try:
+                    resp = requests.get(self.url, headers=headers, stream=False, timeout=10, proxies=self.proxies or None, verify=self.verify)
+                except SSLError as e:
+                    # If SSL error, ask user (via prompt_callback) whether to continue ignoring SSL errors
+                    self.update_callback(f"\n[SSL Error] {e} for {self.url}\n")
+                    if self.prompt_callback:
+                        try:
+                            should_ignore = self.prompt_callback(self.url)
+                        except Exception:
+                            should_ignore = False
+                        if should_ignore:
+                            self.verify = False
+                            # next loop will retry immediately
+                            time.sleep(0.1)
+                            continue
+                    time.sleep(self.interval)
+                    continue
 
                 if resp.status_code in (200, 206):
                     content = resp.content
@@ -86,7 +107,7 @@ class LogReaderThread(threading.Thread):
 
 
 class LogTab:
-    def __init__(self, notebook, url, name=None, interval=1.0):
+    def __init__(self, notebook, url, name=None, interval=1.0, proxies=None, verify=True, prompt_callback=None):
         self.frame = ttk.Frame(notebook)
         self.url = url
         self.name = name or url
@@ -116,7 +137,9 @@ class LogTab:
 
         ttk.Checkbutton(controls, text='Auto-scroll', variable=self.auto_scroll).pack(side='left', padx=8)
 
-        self.thread = LogReaderThread(self.url, self._on_update, interval=interval)
+        # pass proxies/verify and a prompt callback so threads can ask GUI to ignore SSL
+        self._prompt_cb = prompt_callback
+        self.thread = LogReaderThread(self.url, self._on_update, interval=interval, proxies=proxies, verify=verify, prompt_callback=self.prompt_ssl_continue)
         self.thread.start()
 
         # --- Controls: búsqueda / filtro / resaltado ---
@@ -267,6 +290,24 @@ class LogTab:
         if self.current_match != -1:
             self.goto_match(self.current_match)
 
+    def prompt_ssl_continue(self, url):
+        # Called from background thread. Schedule a dialog in main thread and wait for result.
+        ev = threading.Event()
+        result = {}
+
+        def ask():
+            ans = messagebox.askyesno('SSL inseguro', f'El certificado de {url} parece inseguro. ¿Continuar e ignorar errores SSL para esta conexión?')
+            result['ans'] = ans
+            ev.set()
+
+        try:
+            # schedule on GUI thread
+            self.text.after(0, ask)
+            ev.wait()
+            return bool(result.get('ans'))
+        except Exception:
+            return False
+
     def goto_match(self, index):
         if not self.matches:
             return
@@ -300,10 +341,16 @@ class LogViewerApp:
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill='both', expand=True)
 
+        # global network settings
+        self.proxies = {}
+        self.verify_default = True
+
         menubar = tk.Menu(root)
         filemenu = tk.Menu(menubar, tearoff=0)
         filemenu.add_command(label='Añadir log...', command=self.add_log_dialog)
         filemenu.add_command(label='Cerrar pestaña', command=self.close_current_tab)
+        filemenu.add_separator()
+        filemenu.add_command(label='Configuración...', command=self.open_settings)
         filemenu.add_separator()
         filemenu.add_command(label='Salir', command=self.on_exit)
         menubar.add_cascade(label='Archivo', menu=filemenu)
@@ -312,7 +359,7 @@ class LogViewerApp:
         self.tabs = {}
 
     def add_log(self, url, name=None, interval=1.0):
-        tab = LogTab(self.notebook, url, name=name, interval=interval)
+        tab = LogTab(self.notebook, url, name=name, interval=interval, proxies=self.proxies, verify=self.verify_default, prompt_callback=None)
         display = name or url
         self.notebook.add(tab.frame, text=display)
         self.tabs[tab.frame] = tab
@@ -343,6 +390,45 @@ class LogViewerApp:
         for tab in list(self.tabs.values()):
             tab.stop()
         self.root.quit()
+
+    def open_settings(self):
+        # Simple settings dialog to set proxies and default SSL verify
+        dlg = tk.Toplevel(self.root)
+        dlg.title('Configuración de red')
+        dlg.transient(self.root)
+
+        ttk.Label(dlg, text='HTTP proxy (ej. http://user:pass@proxy:3128):').grid(row=0, column=0, sticky='w')
+        http_var = tk.StringVar(value=self.proxies.get('http', ''))
+        http_e = ttk.Entry(dlg, textvariable=http_var, width=60)
+        http_e.grid(row=0, column=1, padx=6, pady=4)
+
+        ttk.Label(dlg, text='HTTPS proxy (ej. http://user:pass@proxy:3128):').grid(row=1, column=0, sticky='w')
+        https_var = tk.StringVar(value=self.proxies.get('https', ''))
+        https_e = ttk.Entry(dlg, textvariable=https_var, width=60)
+        https_e.grid(row=1, column=1, padx=6, pady=4)
+
+        verify_var = tk.BooleanVar(value=self.verify_default)
+        ttk.Checkbutton(dlg, text='Verificar certificados SSL (recomendado)', variable=verify_var).grid(row=2, column=0, columnspan=2, sticky='w', padx=6)
+
+        def save():
+            p = {}
+            if http_var.get().strip():
+                p['http'] = http_var.get().strip()
+            if https_var.get().strip():
+                p['https'] = https_var.get().strip()
+            self.proxies = p
+            self.verify_default = bool(verify_var.get())
+            # update existing tabs
+            for tab in list(self.tabs.values()):
+                try:
+                    tab.thread.proxies = dict(self.proxies)
+                    tab.thread.verify = self.verify_default
+                except Exception:
+                    pass
+            dlg.destroy()
+
+        ttk.Button(dlg, text='Guardar', command=save).grid(row=3, column=0, pady=8)
+        ttk.Button(dlg, text='Cancelar', command=dlg.destroy).grid(row=3, column=1, pady=8)
 
 
 def main():
