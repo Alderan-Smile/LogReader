@@ -97,7 +97,8 @@ class LogTab:
         self.buffer = ""
         self.matches = []
         self.current_match = -1
-        self.auto_scroll = tk.BooleanVar(value=True)
+        # Auto-scroll default off: do not force user to the end on updates
+        self.auto_scroll = tk.BooleanVar(value=False)
 
         controls = ttk.Frame(self.frame)
         controls.pack(fill='x')
@@ -156,6 +157,13 @@ class LogTab:
             pass
 
     def refresh_view(self):
+        # determine whether view is currently at bottom (before update)
+        try:
+            first, last = self.text.yview()
+            at_bottom_before = last >= 0.995
+        except Exception:
+            at_bottom_before = True
+
         # apply filter if present
         filt = self.filter_var.get().strip()
         if filt:
@@ -176,7 +184,8 @@ class LogTab:
         # re-run highlight for current search
         if self.search_var.get().strip():
             self.highlight_matches(self.search_var.get().strip())
-        if self.auto_scroll.get():
+        # Only auto-scroll if the user enabled it AND the view was already at the bottom
+        if self.auto_scroll.get() and at_bottom_before:
             self.text.see(tk.END)
         self.text.configure(state='disabled')
 
