@@ -4,6 +4,8 @@ from requests.exceptions import SSLError
 import time
 import json
 import os
+import hashlib
+from pathlib import Path
 import re
 import tkinter as tk
 from tkinter import simpledialog, messagebox
@@ -12,7 +14,7 @@ from tkinter import ttk
 
 
 class LogReaderThread(threading.Thread):
-    def __init__(self, url, update_callback, interval=1.0, proxies=None, verify=True, prompt_callback=None):
+    def __init__(self, url, update_callback, interval=1.0, proxies=None, verify=True, prompt_callback=None, auto_accept_ssl=False):
         super().__init__(daemon=True)
         self.url = url
         self.update_callback = update_callback
@@ -27,6 +29,7 @@ class LogReaderThread(threading.Thread):
         self.verify = verify
         # callback(url) -> bool (whether to continue ignoring SSL)
         self.prompt_callback = prompt_callback
+        self.auto_accept_ssl = bool(auto_accept_ssl)
 
     def run(self):
         while not self._stop_event.is_set():
@@ -41,9 +44,32 @@ class LogReaderThread(threading.Thread):
 
                 try:
                     resp = requests.get(self.url, headers=headers, stream=False, timeout=10, proxies=self.proxies or None, verify=self.verify)
+                    # If server responds with 416 Range Not Satisfiable, file was likely rotated/truncated
+                    if resp.status_code == 416:
+                        # Reset tracking and fetch full file
+                        self._pos = 0
+                        self._last_content = b""
+                        try:
+                            full = requests.get(self.url, timeout=10, proxies=self.proxies or None, verify=self.verify)
+                            if full.status_code == 200:
+                                content = full.content
+                                # replace whole view because file restarted
+                                self._pos = len(content)
+                                self._last_content = content
+                                self.update_callback(content.decode('utf-8', errors='replace'), replace=True)
+                                time.sleep(self.interval)
+                                continue
+                        except Exception:
+                            time.sleep(self.interval)
+                            continue
                 except SSLError as e:
                     # If SSL error, ask user (via prompt_callback) whether to continue ignoring SSL errors
                     self.update_callback(f"\n[SSL Error] {e} for {self.url}\n")
+                    if self.auto_accept_ssl:
+                        self.verify = False
+                        # retry immediately
+                        time.sleep(0.1)
+                        continue
                     if self.prompt_callback:
                         try:
                             should_ignore = self.prompt_callback(self.url)
@@ -109,7 +135,7 @@ class LogReaderThread(threading.Thread):
 
 
 class LogTab:
-    def __init__(self, notebook, url, name=None, interval=1.0, proxies=None, verify=True, prompt_callback=None, auto_scroll_default=False):
+    def __init__(self, notebook, url, name=None, interval=1.0, proxies=None, verify=True, prompt_callback=None, auto_scroll_default=False, cache_path=None, use_cache=False):
         self.frame = ttk.Frame(notebook)
         self.url = url
         self.name = name or url
@@ -129,6 +155,18 @@ class LogTab:
         self.current_match = -1
         # Auto-scroll default off: do not force user to the end on updates
         self.auto_scroll = tk.BooleanVar(value=auto_scroll_default)
+
+        # cache settings
+        self.use_cache = bool(use_cache)
+        self.cache_path = cache_path
+        if self.use_cache and self.cache_path:
+            try:
+                p = Path(self.cache_path)
+                if p.exists():
+                    with p.open('r', encoding='utf-8', errors='replace') as f:
+                        self.buffer = f.read()
+            except Exception:
+                self.buffer = ""
 
         controls = ttk.Frame(self.frame)
         controls.pack(fill='x')
@@ -177,8 +215,22 @@ class LogTab:
         # maintain internal buffer then refresh view according to any filter
         if replace:
             self.buffer = new_text
+            # overwrite cache file if using cache
+            if self.use_cache and self.cache_path:
+                try:
+                    with open(self.cache_path, 'w', encoding='utf-8', errors='replace') as f:
+                        f.write(self.buffer)
+                except Exception:
+                    pass
         else:
             self.buffer += new_text
+            # append to cache file
+            if self.use_cache and self.cache_path and new_text:
+                try:
+                    with open(self.cache_path, 'a', encoding='utf-8', errors='replace') as f:
+                        f.write(new_text)
+                except Exception:
+                    pass
 
         def ui_update():
             self.refresh_view()
@@ -374,11 +426,19 @@ class LogViewerApp:
         self.proxies = cfg.get('proxies', {})
         self.verify_default = cfg.get('verify_default', True)
         self.auto_scroll_default = cfg.get('auto_scroll_default', False)
+        self.use_cache_default = cfg.get('use_cache_default', False)
+        self.auto_accept_ssl = cfg.get('auto_accept_ssl', False)
+
+        # session path
+        self.session_path = os.path.join(os.path.dirname(__file__), 'session.json')
 
         menubar = tk.Menu(root)
         filemenu = tk.Menu(menubar, tearoff=0)
         filemenu.add_command(label='Añadir log...', command=self.add_log_dialog)
         filemenu.add_command(label='Cerrar pestaña', command=self.close_current_tab)
+        # keep a persistent BooleanVar for the menu checkbutton so it reflects changes
+        self._auto_accept_ssl_var = tk.BooleanVar(value=self.auto_accept_ssl)
+        filemenu.add_checkbutton(label='Auto-aceptar SSL', variable=self._auto_accept_ssl_var, command=self.toggle_auto_accept_ssl)
         filemenu.add_separator()
         filemenu.add_command(label='Configuración...', command=self.open_settings)
         filemenu.add_separator()
@@ -387,9 +447,21 @@ class LogViewerApp:
         root.config(menu=menubar)
 
         self.tabs = {}
+        # restore previous session (after tabs dict created)
+        try:
+            self.load_session()
+        except Exception:
+            pass
 
     def add_log(self, url, name=None, interval=1.0):
-        tab = LogTab(self.notebook, url, name=name, interval=interval, proxies=self.proxies, verify=self.verify_default, prompt_callback=None, auto_scroll_default=self.auto_scroll_default)
+        # create cache dir
+        cache_dir = os.path.join(os.path.dirname(__file__), 'cache')
+        os.makedirs(cache_dir, exist_ok=True)
+        # deterministic cache filename from url
+        h = hashlib.sha1(url.encode('utf-8')).hexdigest()
+        safe_name = f"log_{h}.log"
+        cache_path = os.path.join(cache_dir, safe_name)
+        tab = LogTab(self.notebook, url, name=name, interval=interval, proxies=self.proxies, verify=self.verify_default, prompt_callback=None, auto_scroll_default=self.auto_scroll_default, cache_path=cache_path, use_cache=self.use_cache_default)
         display = name or url
         self.notebook.add(tab.frame, text=display)
         self.tabs[tab.frame] = tab
@@ -405,6 +477,26 @@ class LogViewerApp:
             interval = 1.0
         self.add_log(url, name=name, interval=interval)
 
+    def toggle_auto_accept_ssl(self):
+        # toggle the flag and apply to running threads
+        try:
+            val = bool(self._auto_accept_ssl_var.get())
+            self.auto_accept_ssl = val
+            for tab in list(self.tabs.values()):
+                try:
+                    tab.thread.auto_accept_ssl = val
+                except Exception:
+                    pass
+            # persist change to config immediately
+            try:
+                cfg = self.load_config()
+                cfg['auto_accept_ssl'] = self.auto_accept_ssl
+                self.save_config(cfg)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def close_current_tab(self):
         cur = self.notebook.select()
         if not cur:
@@ -419,11 +511,48 @@ class LogViewerApp:
         # stop all threads
         for tab in list(self.tabs.values()):
             tab.stop()
+        # save session
+        try:
+            self.save_session()
+        except Exception:
+            pass
         self.root.quit()
+
+    def save_session(self):
+        session = {'tabs': []}
+        for tab in list(self.tabs.values()):
+            try:
+                item = {
+                    'url': tab.url,
+                    'name': tab.name,
+                    'interval': tab.thread.interval,
+                    'use_cache': bool(tab.use_cache),
+                }
+                session['tabs'].append(item)
+            except Exception:
+                pass
+        try:
+            with open(self.session_path, 'w', encoding='utf-8') as f:
+                json.dump(session, f, indent=2)
+        except Exception:
+            pass
+
+    def load_session(self):
+        try:
+            if os.path.exists(self.session_path):
+                with open(self.session_path, 'r', encoding='utf-8') as f:
+                    session = json.load(f)
+                for t in session.get('tabs', []):
+                    try:
+                        self.add_log(t.get('url'), name=t.get('name'), interval=t.get('interval', 1.0))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def load_config(self):
         # Load config.json or create default
-        default = {'proxies': {}, 'verify_default': True, 'auto_scroll_default': False}
+        default = {'proxies': {}, 'verify_default': True, 'auto_scroll_default': False, 'use_cache_default': False, 'auto_accept_ssl': False}
         try:
             if os.path.exists(self.config_path):
                 with open(self.config_path, 'r', encoding='utf-8') as f:
@@ -464,10 +593,16 @@ class LogViewerApp:
         https_e.grid(row=1, column=1, padx=6, pady=4)
 
         verify_var = tk.BooleanVar(value=self.verify_default)
-        ttk.Checkbutton(dlg, text='Verificar certificados SSL (recomendado)', variable=verify_var).grid(row=2, column=0, columnspan=2, sticky='w', padx=6)
+        ttk.Checkbutton(dlg, text='Verificar certificados SSL (recomendado)', variable=verify_var).grid(row=2, column=0, columnspan=1, sticky='w', padx=6)
 
         autos_var = tk.BooleanVar(value=self.auto_scroll_default)
         ttk.Checkbutton(dlg, text='Auto-scroll al final por defecto', variable=autos_var).grid(row=2, column=1, columnspan=1, sticky='w', padx=6)
+
+        cache_var = tk.BooleanVar(value=self.use_cache_default)
+        ttk.Checkbutton(dlg, text='Usar caché local para logs (guardar en disco)', variable=cache_var).grid(row=3, column=0, columnspan=2, sticky='w', padx=6, pady=4)
+
+        autoaccept_var = tk.BooleanVar(value=self.auto_accept_ssl)
+        ttk.Checkbutton(dlg, text='Auto-aceptar errores SSL (ignorar certificados inválidos)', variable=autoaccept_var).grid(row=4, column=0, columnspan=2, sticky='w', padx=6, pady=4)
 
         def save():
             p = {}
@@ -478,12 +613,16 @@ class LogViewerApp:
             self.proxies = p
             self.verify_default = bool(verify_var.get())
             self.auto_scroll_default = bool(autos_var.get())
+            self.use_cache_default = bool(cache_var.get())
+            self.auto_accept_ssl = bool(autoaccept_var.get())
             # update existing tabs
             for tab in list(self.tabs.values()):
                 try:
                     tab.thread.proxies = dict(self.proxies)
                     tab.thread.verify = self.verify_default
                     tab.auto_scroll.set(self.auto_scroll_default)
+                    tab.use_cache = self.use_cache_default
+                    tab.thread.auto_accept_ssl = self.auto_accept_ssl
                 except Exception:
                     pass
             # save to config
@@ -491,6 +630,8 @@ class LogViewerApp:
                 'proxies': self.proxies,
                 'verify_default': self.verify_default,
                 'auto_scroll_default': self.auto_scroll_default,
+                'use_cache_default': self.use_cache_default,
+                'auto_accept_ssl': self.auto_accept_ssl,
             }
             try:
                 self.save_config(cfg)
@@ -498,8 +639,8 @@ class LogViewerApp:
                 pass
             dlg.destroy()
 
-        ttk.Button(dlg, text='Guardar', command=save).grid(row=3, column=0, pady=8)
-        ttk.Button(dlg, text='Cancelar', command=dlg.destroy).grid(row=3, column=1, pady=8)
+        ttk.Button(dlg, text='Guardar', command=save).grid(row=5, column=0, pady=8)
+        ttk.Button(dlg, text='Cancelar', command=dlg.destroy).grid(row=5, column=1, pady=8)
 
 
 def main():
