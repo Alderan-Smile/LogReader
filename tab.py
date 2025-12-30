@@ -9,6 +9,7 @@ import tkinter as tk
 from tkinter import messagebox
 from tkinter import scrolledtext
 from tkinter import ttk
+from tkinter import Listbox
 
 from reader import LogReaderThread
 
@@ -113,6 +114,12 @@ class LogTab:
         self._search_thread = None
         self._search_queue = queue.Queue()
         self._showing_search_results = False
+        # UI widget for search results (hidden until needed)
+        self._results_frame = ttk.Frame(self.frame)
+        self._results_list = Listbox(self._results_frame, height=8)
+        self._results_list.pack(fill='both', expand=True)
+        self._results_frame.pack_forget()
+        self._results_list.bind('<<ListboxSelect>>', lambda e: self._on_result_select())
 
     def _on_update(self, new_text, replace=False):
         # maintain internal buffer then refresh view according to any filter
@@ -192,16 +199,30 @@ class LogTab:
                 self.search_status.set('')
             return
 
-        # res is list of matched lines (strings)
+        # res is list of tuples (byte_offset, line)
         matches = res
         self._showing_search_results = True
-        # display matches as the view (replace)
         try:
-            self.text.configure(state='normal')
-            self.text.delete('1.0', tk.END)
-            self.text.insert(tk.END, ''.join(matches))
-            self.text.configure(state='disabled')
+            # populate results listbox with preview lines
+            self._results_list.delete(0, tk.END)
+            for off, line in matches:
+                preview = line.strip()
+                if len(preview) > 200:
+                    preview = preview[:197] + '...'
+                self._results_list.insert(tk.END, preview)
+            # show results frame
+            self._results_frame.pack(fill='both', padx=4, pady=4)
             self.search_status.set(f'Mostrando {len(matches)} coincidencias')
+            # try to highlight matches inside current buffer quickly
+            try:
+                term = self.search_var.get().strip()
+                if term:
+                    self.text.configure(state='normal')
+                    self.clear_highlight()
+                    self.highlight_matches(term)
+                    self.text.configure(state='disabled')
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -235,7 +256,7 @@ class LogTab:
                                 if line_end == -1:
                                     line_end = m.size()
                                 line = m[line_start:line_end].decode('utf-8', errors='replace')
-                                matches.append(line + '\n')
+                                matches.append((line_start, line + '\n'))
                                 if len(matches) >= MAX_MATCHES:
                                     break
                         else:
@@ -243,8 +264,14 @@ class LogTab:
                             # This is slower but avoids type issues
                             data = m[:].decode('utf-8', errors='replace')
                             for mobj in re.finditer(term, data):
-                                line = data[data.rfind('\n', 0, mobj.start()) + 1:data.find('\n', mobj.start())]
-                                matches.append(line + '\n')
+                                line_start_char = data.rfind('\n', 0, mobj.start()) + 1
+                                line_end_char = data.find('\n', mobj.start())
+                                if line_end_char == -1:
+                                    line_end_char = len(data)
+                                line = data[line_start_char:line_end_char]
+                                # approximate byte offset by encoding portion before line
+                                byte_offset = data[:line_start_char].encode('utf-8', errors='replace')
+                                matches.append((len(byte_offset), line + '\n'))
                                 if len(matches) >= MAX_MATCHES:
                                     break
                     else:
@@ -259,7 +286,7 @@ class LogTab:
                             if line_end == -1:
                                 line_end = m.size()
                             line = m[line_start:line_end].decode('utf-8', errors='replace')
-                            matches.append(line + '\n')
+                            matches.append((line_start, line + '\n'))
                             if len(matches) >= MAX_MATCHES:
                                 break
                             idx = idx + len(needle)
@@ -270,6 +297,57 @@ class LogTab:
         try:
             # limit to first 1000 matches to avoid huge UI
             self._search_queue.put(matches[:1000])
+        except Exception:
+            pass
+
+    def _on_result_select(self):
+        # Called when user selects a result from the results listbox
+        sel = self._results_list.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        try:
+            item = self._search_queue.get_nowait()
+            # put it back for future polls
+            self._search_queue.put(item)
+        except Exception:
+            pass
+        # We don't keep matches stored long-term; instead, recompute by running search thread synchronously for this index
+        try:
+            # read the corresponding line/offset from cache by re-running a small read
+            with open(self.cache_path, 'rb') as f:
+                # We will iterate the file until we reach the idx-th match (inefficient for large idx but acceptable)
+                count = 0
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+                    term = self.search_var.get().strip().encode('utf-8')
+                    p = 0
+                    while True:
+                        p = m.find(term, p)
+                        if p == -1:
+                            break
+                        line_start = m.rfind(b'\n', 0, p) + 1
+                        if count == idx:
+                            # load a chunk around line_start
+                            start = max(0, line_start - 4096)
+                            end = min(m.size(), line_start + 16384)
+                            chunk = m[start:end]
+                            try:
+                                s = chunk.decode('utf-8', errors='replace')
+                            except Exception:
+                                s = chunk.decode('latin-1', errors='replace')
+                            # replace buffer with chunk and refresh view
+                            self.buffer = s
+                            # hide results
+                            self._results_frame.pack_forget()
+                            self.refresh_view()
+                            # highlight and go to match inside view
+                            self.text.configure(state='normal')
+                            self.clear_highlight()
+                            self.highlight_matches(self.search_var.get().strip())
+                            self.text.configure(state='disabled')
+                            return
+                        count += 1
+                        p = p + len(term)
         except Exception:
             pass
 
