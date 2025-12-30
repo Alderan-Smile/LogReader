@@ -2,6 +2,7 @@ import threading
 import requests
 from requests.exceptions import SSLError
 import time
+import re
 
 
 class LogReaderThread(threading.Thread):
@@ -84,16 +85,44 @@ class LogReaderThread(threading.Thread):
                     # mark initial as loaded after a successful response
                     if not self._initial_loaded:
                         self._initial_loaded = True
-                        # We will treat received content as the current snapshot
+                        # Try to set absolute position from Content-Range if present
+                        cr = resp.headers.get('Content-Range')
+                        if cr:
+                            m = re.match(r'bytes (\d+)-(\d+)/(\d+|\*)', cr)
+                            if m:
+                                start = int(m.group(1))
+                                end = int(m.group(2))
+                                # set position to end+1 (absolute file offset)
+                                self._pos = end + 1
+                            else:
+                                # fallback: use length
+                                self._pos = len(content)
+                        else:
+                            # no Content-Range -> treat as snapshot/full content
+                            self._pos = len(content)
+
                         self._last_content = content
-                        self._pos = len(content)
                         self.update_callback(content.decode('utf-8', errors='replace'), replace=True)
                         time.sleep(self.interval)
                         continue
+
                     # If server responded with partial content (206) append
                     if resp.status_code == 206:
-                        if content:
+                        cr = resp.headers.get('Content-Range')
+                        if cr:
+                            m = re.match(r'bytes (\d+)-(\d+)/(\d+|\*)', cr)
+                            if m:
+                                start = int(m.group(1))
+                                end = int(m.group(2))
+                                # set absolute pos to end+1
+                                self._pos = end + 1
+                            else:
+                                # fallback to increment
+                                self._pos += len(content)
+                        else:
                             self._pos += len(content)
+
+                        if content:
                             self.update_callback(content.decode('utf-8', errors='replace'))
                     else:
                         # 200 OK: server may not support Range. Try to detect new bytes without duplicating or reordering
